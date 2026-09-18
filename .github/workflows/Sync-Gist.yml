@@ -1,0 +1,60 @@
+name: Sync Gist with History
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  GIST_ID: c6a98bad66f358daf6d9b0128c4aed74
+  DEST_DIR: gist
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout target repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Clone gist
+        run: |
+          git clone "https://gist.github.com/${GIST_ID}.git" /tmp/gist
+
+      - name: Rebuild gist directory with full history
+        run: |
+          set -euo pipefail
+          cd /tmp/gist
+          LATEST=$(git rev-parse HEAD)
+
+          # 清空并重建目标目录
+          rm -rf "${GITHUB_WORKSPACE}/${DEST_DIR}"
+          mkdir -p "${GITHUB_WORKSPACE}/${DEST_DIR}/versions"
+
+          # 遍历所有历史提交（从旧到新），跳过最新
+          for commit in $(git rev-list --reverse HEAD); do
+            if [ "$commit" = "$LATEST" ]; then
+              continue
+            fi
+            short=$(git rev-parse --short=8 "$commit")
+            dir="${GITHUB_WORKSPACE}/${DEST_DIR}/versions/${short}"
+            mkdir -p "$dir"
+            git archive "$commit" | tar -x -C "$dir"
+          done
+
+          # 最新提交的文件放到 gist/ 根目录
+          git archive "$LATEST" | tar -x -C "${GITHUB_WORKSPACE}/${DEST_DIR}"
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A "${DEST_DIR}"
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Sync gist ${GIST_ID} with full history"
+            git push
+          fi
