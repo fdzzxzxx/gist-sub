@@ -2,17 +2,25 @@ name: Sync Gist with History
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: '0 */6 * * *'
 
 permissions:
   contents: write
 
+concurrency:
+  group: sync-gist
+  cancel-in-progress: true
+
 env:
   GIST_ID: c6a98bad66f358daf6d9b0128c4aed74
   DEST_DIR: gist
+  LOG_FILE: gist/.gist-sync.log
 
 jobs:
   sync:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout target repo
         uses: actions/checkout@v4
@@ -23,38 +31,58 @@ jobs:
         run: |
           git clone "https://gist.github.com/${GIST_ID}.git" /tmp/gist
 
-      - name: Rebuild gist directory with full history
+      - name: Sync versions
         run: |
           set -euo pipefail
           cd /tmp/gist
           LATEST=$(git rev-parse HEAD)
+          ROOT="${GITHUB_WORKSPACE}"
+          LOG="${ROOT}/${LOG_FILE}"
+          LOG_NAME="$(basename "$LOG_FILE")"
 
-          # 清空并重建目标目录
-          rm -rf "${GITHUB_WORKSPACE}/${DEST_DIR}"
-          mkdir -p "${GITHUB_WORKSPACE}/${DEST_DIR}/versions"
+          mkdir -p "${ROOT}/${DEST_DIR}/versions"
+          touch "$LOG"
 
-          # 遍历所有历史提交（从旧到新），跳过最新
+          added=0
           for commit in $(git rev-list --reverse HEAD); do
-            if [ "$commit" = "$LATEST" ]; then
+            [ "$commit" = "$LATEST" ] && continue
+
+            if grep -q "^${commit} " "$LOG"; then
               continue
             fi
+
             short=$(git rev-parse --short=8 "$commit")
-            dir="${GITHUB_WORKSPACE}/${DEST_DIR}/versions/${short}"
+            dir="${ROOT}/${DEST_DIR}/versions/${short}"
+
+            if [ -e "$dir" ]; then
+              echo "$commit $(git show -s --format=%cI "$commit")" >> "$LOG"
+              continue
+            fi
+
             mkdir -p "$dir"
             git archive "$commit" | tar -x -C "$dir"
+            echo "$commit $(git show -s --format=%cI "$commit")" >> "$LOG"
+            added=$((added + 1))
+            echo "已归档 $short"
           done
 
-          # 最新提交的文件放到 gist/ 根目录
-          git archive "$LATEST" | tar -x -C "${GITHUB_WORKSPACE}/${DEST_DIR}"
+          # 刷新根目录为最新版，但保留日志文件
+          find "${ROOT}/${DEST_DIR}" -maxdepth 1 -type f \
+            ! -name "$LOG_NAME" -delete
+          git archive "$LATEST" | tar -x -C "${ROOT}/${DEST_DIR}"
+
+          echo "本次新增 $added 个历史版本"
 
       - name: Commit and push
         run: |
+          set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -A "${DEST_DIR}"
+          git add -A
           if git diff --staged --quiet; then
-            echo "No changes to commit"
-          else
-            git commit -m "Sync gist ${GIST_ID} with full history"
-            git push
+            echo "无变化"
+            exit 0
           fi
+          git commit -m "Sync gist ${GIST_ID} ($(date -u +%FT%TZ))"
+          git pull --rebase origin "${GITHUB_REF_NAME}" || true
+          git push
